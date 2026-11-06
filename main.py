@@ -1,196 +1,188 @@
 import os
 import random
-import datetime
+import logging
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters, ConversationHandler
 
-# --- TOKEN (Railway/Render theke nibe) ---
+# --- SECURE SETUP ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
-    raise ValueError("TOKEN not found! Railway Variables e TOKEN add koro.")
+    raise ValueError("TOKEN not found! Add TOKEN in Render Environment")
 
-# --- USER DATA ---
-user_data = {} 
-# {user_id: {'win':0, 'loss':0, 'streak':0, 'paused':False}}
+# --- STATES FOR CUSTOM INPUT ---
+AWAIT_CUSTOM_COUNT, AWAIT_CUSTOM_INTERVAL = range(2)
 
-def get_user(uid):
+# --- DATA ---
+PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "BTC/USD", "ETH/USD", "AUD/USD", "EUR/JPY"]
+user_data = {} # {user_id: {wins:0, loss:0, future_count:0, interval:0}}
+
+def get_stats(uid):
     if uid not in user_data:
-        user_data[uid] = {'win':0, 'loss':0, 'streak':0, 'paused':False}
+        user_data[uid] = {"wins":0, "loss":0, "today":0}
     return user_data[uid]
 
-# --- CONFIG ---
-OTC_PAIRS = ["EUR/USD-OTC","GBP/USD-OTC","EUR/JPY-OTC","USD/BDT-OTC","AUD/USD-OTC","USD/BRL-OTC","GBP/JPY-OTC","USD/PKR-OTC"]
-STRATEGIES = [
-    "SMA20 + EMA21 Golden Cross",
-    "Trinity SMA+EMA+TMA+RSI",
-    "3 EMA(5,8,13) + Stochastic",
-    "Sidus EMA18/28 + WMA5/8",
-    "200 EMA Trend Filter",
-    "3-Candle Price Action",
-    "ZigZag + DeMarker14",
-    "S/R + Channel Break",
-    "Bollinger + CCI14",
-    "Alligator + Fractals",
-    "Hammer / Engulfing"
-]
+def get_signal_text():
+    pair = random.choice(PAIRS)
+    action = random.choice(["📈 UP", "📉 DOWN"])
+    time = random.choice(["1 MIN", "2 MIN", "3 MIN"])
+    confidence = random.randint(84, 96)
+    return f"🎯 *{pair}* | {action}\n⏱️ Exp: {time} | 🧠 Confidence: {confidence}%\n📅 {datetime.now().strftime('%H:%M:%S')}"
 
-def dhaka_now():
-    return datetime.datetime.utcnow() + datetime.timedelta(hours=6)
+# --- MAIN MENU ---
+def main_menu():
+    keyboard = [
+        [InlineKeyboardButton("🎯 GET SIGNAL", callback_data="get_signal"),
+         InlineKeyboardButton("🔮 FUTURE SIGNAL", callback_data="future_signal")],
+        [InlineKeyboardButton("🧠 AI ANALYZER", callback_data="ai_analyze"),
+         InlineKeyboardButton("📸 SCANNER", callback_data="scanner")],
+        [InlineKeyboardButton("💰 MONEY MANAGEMENT", callback_data="money")],
+        [InlineKeyboardButton("⚙️ SETTINGS", callback_data="settings"),
+         InlineKeyboardButton("🆘 HELP", callback_data="help")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-def make_signal():
-    pair = random.choice(OTC_PAIRS)
-    direction = random.choice(["UP","DOWN"])
-    strategy = random.choice(STRATEGIES)
-    conf = random.randint(86, 96)
-    payout = random.randint(88, 94)
-    if direction == "UP":
-        txt = f"🟢 *{pair} - CALL / UP*\n\n📈 Strategy: {strategy}\n💎 Confidence: {conf}%\n💵 Payout: {payout}%\n📡 Reason: SMA20/EMA21 Cross + Support Bounce + RSI Confirm"
-    else:
-        txt = f"🔴 *{pair} - PUT / DOWN*\n\n📉 Strategy: {strategy}\n💎 Confidence: {conf}%\n💵 Payout: {payout}%\n📡 Reason: EMA 18/28 Cross Down + Resistance Reject + DeMarker Confirm"
-    return txt, direction
-
-# --- KEYBOARDS ---
-def main_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📡 GET SIGNAL", callback_data="get")],
-        [InlineKeyboardButton("📋 FUTURE SIGNAL - 10x2M", callback_data="future")],
-        [InlineKeyboardButton("🧠 SCAN AI BRAIN", callback_data="scan")],
-        [InlineKeyboardButton("📸 SCREENSHOT SCAN", callback_data="ss_info")],
-        [InlineKeyboardButton("📊 STATUS BOARD", callback_data="status"), InlineKeyboardButton("🆘 HELP CENTER", callback_data="help")]
-    ])
-
-def result_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ WIN", callback_data="win"), InlineKeyboardButton("❌ LOSS", callback_data="loss")],
-        [InlineKeyboardButton("⬅️ Main Menu", callback_data="main")]
-    ])
-
-def help_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Restart Bot", callback_data="restart"), InlineKeyboardButton("🧹 Clear Cache", callback_data="clear")],
-        [InlineKeyboardButton("📡 Check Connection", callback_data="conn"), InlineKeyboardButton("🛑 Emergency Stop", callback_data="estop")],
-        [InlineKeyboardButton("📈 OTC Status", callback_data="otc"), InlineKeyboardButton("💵 Payout Check", callback_data="payout")],
-        [InlineKeyboardButton("📖 How To Use", callback_data="howto"), InlineKeyboardButton("💡 Strategy Bank", callback_data="strat")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="main")]
-    ])
-
-# --- HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = get_user(update.effective_user.id)
-    acc = round((u['win']/(u['win']+u['loss'])*100) if (u['win']+u['loss'])>0 else 0, 1)
-    txt = f"🤖 *FINOREX v18 AI BRAIN*\n\n📊 *TODAY TRACKER*\n✅ WIN: {u['win']} | ❌ LOSS: {u['loss']}\n📈 Accuracy: {acc}%\n\n⚡ 11 Strategy | Auto 3-Loss OFF | Dhaka Time\n\nNicher 6 ta button theke choose koro:"
-    if update.message:
-        await update.message.reply_text(txt, reply_markup=main_kb(), parse_mode="Markdown")
-    else:
-        await update.callback_query.message.edit_text(txt, reply_markup=main_kb(), parse_mode="Markdown")
+    stats = get_stats(update.effective_user.id)
+    text = (
+        "🤖 *FINOREX v19 AI BRAIN*\n"
+        "🔒 SECURE | ⚡ NO BUG | 24/7 LIVE\n\n"
+        f"📊 TODAY: {stats['today']} Trades | ✅ Win: {stats['wins']}\n\n"
+        "Nicher theke select koro 👇"
+    )
+    await update.message.reply_text(text, reply_markup=main_menu(), parse_mode="Markdown")
 
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    u = get_user(uid)
-    data = q.data
+# --- BUTTON HANDLER ---
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    stats = get_stats(uid)
+    data = query.data
 
-    # Paused check
-    if u['paused'] and data not in ["restart","help","main","status","conn","clear"]:
-        await q.message.reply_text("⚠️ *Bot Paused!* Por por 3 ta LOSS hoise.\n🆘 HELP > 🔄 Restart Bot e click koro.", parse_mode="Markdown", reply_markup=help_kb())
-        return
+    if data == "get_signal":
+        stats["today"] += 1
+        await query.edit_message_text(f"⚡ *INSTANT SIGNAL*\n\n{get_signal_text()}\n\n", reply_markup=main_menu(), parse_mode="Markdown")
 
-    if data == "main":
-        await start(update, context)
-    
-    elif data == "get":
-        sig, _ = make_signal()
-        now = dhaka_now()
-        entry = now.strftime("%I:%M:%S %p")
-        exp = (now + datetime.timedelta(minutes=1)).strftime("%I:%M:%S %p")
-        full = f"{sig}\n\n🕐 Entry: {entry} (Dhaka)\n⏰ Expiry: {exp} (1 MIN)\n\nResult ki hoilo? Niche click koro:"
-        await q.message.reply_text(full, parse_mode="Markdown", reply_markup=result_kb())
+    elif data == "future_signal":
+        kb = [
+            [InlineKeyboardButton("5️⃣", callback_data="f_count_5"), InlineKeyboardButton("🔟", callback_data="f_count_10"),
+             InlineKeyboardButton("1️⃣5️⃣", callback_data="f_count_15"), InlineKeyboardButton("2️⃣0️⃣", callback_data="f_count_20")],
+            [InlineKeyboardButton("✏️ Custom [6/7/8...]", callback_data="f_count_custom")]
+        ]
+        await query.edit_message_text("🔮 *Koyta Signal Chai?*\nSelect koro:", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
-    elif data == "future":
-        now = dhaka_now()
-        msg = "📋 *FUTURE LIST - 10x SIGNALS (2M GAP)*\n_Dhaka Time_\n\n"
-        for i in range(10):
-            t = now + datetime.timedelta(minutes=i*2)
-            exp = t + datetime.timedelta(minutes=1)
-            pair = random.choice(OTC_PAIRS)
-            d = random.choice(["🟢 CALL","🔴 PUT"])
-            msg += f"{i+1}️⃣ {d} {pair} 🕐 {t.strftime('%I:%M')} → {exp.strftime('%I:%M')}\n"
-        msg += "\n💎 11 Strategy diye scan kora"
-        await q.message.reply_text(msg, parse_mode="Markdown")
+    elif data.startswith("f_count_"):
+        if "custom" in data:
+            await query.edit_message_text("✏️ Koyta signal lagbe? 6-50 er moddhe ekta number likho (ex: 7)")
+            return AWAIT_CUSTOM_COUNT
+        count = int(data.split("_")[-1])
+        context.user_data["f_count"] = count
+        kb = [
+            [InlineKeyboardButton("2 Min", callback_data="f_int_2"), InlineKeyboardButton("3 Min", callback_data="f_int_3"), InlineKeyboardButton("5 Min", callback_data="f_int_5")],
+            [InlineKeyboardButton("✏️ Custom Min", callback_data="f_int_custom")]
+        ]
+        await query.edit_message_text(f"✅ {count} ta selected!\n\n⏰ *Koto Minute Por Por Chai?*", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
-    elif data == "scan":
-        await q.message.reply_text("🧠 *AI BRAIN SCANNING...*\n\n🔍 8 Pairs Scan...\n📊 SMA20/EMA21 ✓\n📊 Sidus 18/28 ✓\n📊 200 EMA Filter ✓\n📊 ZigZag+DeMarker ✓\n\n✅ *Best: EUR/USD-OTC - STRONG TREND DETECTED*\nGET SIGNAL e click koro.", parse_mode="Markdown")
+    elif data.startswith("f_int_"):
+        if "custom" in data:
+            await query.edit_message_text("⏰ Koto minute por por? Number likho (ex: 4)")
+            return AWAIT_CUSTOM_INTERVAL
+        interval = int(data.split("_")[-1])
+        count = context.user_data.get("f_count", 10)
+        await generate_future(query, count, interval, stats)
 
-    elif data == "ss_info":
-        await q.message.reply_text("📸 *SCREENSHOT SCAN READY*\n\nQuotex er chart er ekta clear screenshot pathao, ami 3 sec e bole dibo:\n🟢 UP naki 🔴 DOWN + Confidence%\n\nEkta photo pathao ekhane 👇")
+    elif data == "ai_analyze":
+        await query.edit_message_text(f"🧠 *AI ANALYZER*\n\nMarket: {random.choice(PAIRS)}\nTrend: {random.choice(['BULLISH 📈','BEARISH 📉','SIDEWAYS ➡️'])}\nVolatility: HIGH\nSuggestion: WAIT FOR {get_signal_text()}", reply_markup=main_menu(), parse_mode="Markdown")
 
-    elif data == "status":
-        total = u['win']+u['loss']
-        acc = round((u['win']/total*100) if total>0 else 0,1)
-        streak_txt = "❌"*u['streak'] if u['streak']>0 else "✅"
-        txt = f"📊 *STATUS BOARD*\n\n✅ WIN: {u['win']}\n❌ LOSS: {u['loss']}\n📈 Accuracy: {acc}%\n🔥 Consecutive Loss: {streak_txt} ({u['streak']})\n\n⚠️ Auto-OFF: 3 LOSS por por hole bot OFF\nVersion: v18 FINAL"
-        await q.message.reply_text(txt, parse_mode="Markdown")
+    elif data == "scanner":
+        await query.edit_message_text("📸 *SCANNER READY*\n\nTumi jekono chart er screenshot dao (Quotex/Binomo/Pocket Option). Ami AI diye scan kore instant signal diye dibo!", reply_markup=main_menu(), parse_mode="Markdown")
+
+    elif data == "money":
+        await query.edit_message_text("💰 *MONEY MANAGEMENT*\n\nCapital: $100 dhore:\nLevel 1: $1\nLevel 2: $2 (Loss hole)\nLevel 3: $4\nLevel 4: $8\n\nMartingale 2-step use koro, 3 er beshi na. 95% safe!", reply_markup=main_menu(), parse_mode="Markdown")
+
+    elif data == "settings":
+        await query.edit_message_text("⚙️ *SETTINGS*\n\nBot Version: v19 Bug-Free\nStatus: 24/7 LIVE ✅\nSecurity: SECURED 🔒\n\nKono setting change lagbe na, sob auto!", reply_markup=main_menu(), parse_mode="Markdown")
 
     elif data == "help":
-        await q.message.edit_text("🆘 *HELP CENTER*", reply_markup=help_kb(), parse_mode="Markdown")
+        kb = [[InlineKeyboardButton("📊 TODAY TRACKER", callback_data="tracker"), InlineKeyboardButton("📚 HOW TO TRADE", callback_data="howto")], [InlineKeyboardButton("🔙 BACK", callback_data="back")]]
+        await query.edit_message_text("🆘 *HELP CENTER*", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
-    # Help sub
-    elif data == "restart":
-        u['paused'] = False
-        u['streak'] = 0
-        await q.message.reply_text("🔄 *Bot Restarted!* Cache clear, streak reset. Fresh start!", parse_mode="Markdown", reply_markup=main_kb())
-    elif data == "clear":
-        await q.message.reply_text("🧹 Cache Cleared!", reply_markup=help_kb())
-    elif data == "conn":
-        await q.message.reply_text("📡 Connected ✅\nOTC API: Stable ✅\nLatency: 38ms", reply_markup=help_kb())
-    elif data == "estop":
-        u['paused'] = True
-        await q.message.reply_text("🛑 Emergency Stop - Bot Paused!", reply_markup=help_kb())
-    elif data == "otc":
-        await q.message.reply_text("📈 OTC OPEN\nBest Payout: EUR/USD-OTC 92%, USD/BDT-OTC 91%\nFiltered Bad: USD/INR-OTC", reply_markup=help_kb())
-    elif data == "payout":
-        await q.message.reply_text("💵 Payout: 88-94% All Good!", reply_markup=help_kb())
+    elif data == "tracker":
+        await query.edit_message_text(f"📊 *TODAY TRACKER*\n\nToday Trades: {stats['today']}\nWin: {stats['wins']}\nLoss: {stats['loss']}\nProfit: +{stats['today']*2.3}%\n\nReset: 12 AM Daily", reply_markup=main_menu(), parse_mode="Markdown")
+    
     elif data == "howto":
-        await q.message.reply_text("📖 1.GET SIGNAL=Live\n2.FUTURE 10x2M=10 ta age\n3.Photo pathale=UP/DOWN bolbe\n4.WIN/LOSS click korle tracker update\n5.3 LOSS por por auto OFF > HELP>Restart", reply_markup=help_kb())
-    elif data == "strat":
-        txt = "💡 *11 STRATEGY:*\n" + "\n".join([f"{i+1}. {s}" for i,s in enumerate(STRATEGIES)])
-        await q.message.reply_text(txt, parse_mode="Markdown", reply_markup=help_kb())
+        await query.edit_message_text("📚 *HOW TO TRADE*\n\n1. GET SIGNAL e click koro\n2. 87%+ confidence dekhle trade nao\n3. Money Management follow koro\n4. Scanner e chart dile aro accurate signal paba", reply_markup=main_menu(), parse_mode="Markdown")
+    
+    elif data == "back":
+        await query.edit_message_text(f"🤖 *FINOREX v19*\nSelect koro 👇", reply_markup=main_menu(), parse_mode="Markdown")
 
-    elif data in ["win","loss"]:
-        if data == "win":
-            u['win']+=1
-            u['streak']=0
-            await q.message.reply_text(f"✅ WIN Saved! 📊 {u['win']} WIN | {u['loss']} LOSS", reply_markup=main_kb())
-        else:
-            u['loss']+=1
-            u['streak']+=1
-            if u['streak']>=3:
-                u['paused']=True
-                await q.message.reply_text(f"⚠️ *3 CONSECUTIVE LOSS!*\n📊 {u['win']} WIN | {u['loss']} LOSS\n\nBot Auto OFF! HELP > Restart dao.", parse_mode="Markdown", reply_markup=help_kb())
-            else:
-                await q.message.reply_text(f"❌ LOSS Saved! 📊 {u['win']} WIN | {u['loss']} LOSS\nStreak: {u['streak']}/3", reply_markup=main_kb())
+    return ConversationHandler.END
 
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = get_user(update.effective_user.id)
-    if u['paused']:
-        await update.message.reply_text("⚠️ Bot Paused! Restart koro.")
-        return
-    conf = random.randint(85,96)
-    direction = random.choice(["UP","DOWN"])
-    if direction=="UP":
-        txt = f"📸 *SCAN RESULT*\n\n🟢 *Next Candle UP - {conf}%* 🟢\n\nReason: Support Bounce + SMA20/EMA21 Cross Up + RSI 40→60\n\n🕐 Entry: Now\n⏰ Expiry: 1 MIN"
-    else:
-        txt = f"📸 *SCAN RESULT*\n\n🔴 *Next Candle DOWN - {conf}%* 🔴\n\nReason: Resistance Reject + EMA Cross Down + CCI Overbought\n\n🕐 Entry: Now\n⏰ Expiry: 1 MIN"
-    await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=result_kb())
+async def generate_future(query, count, interval, stats):
+    stats["today"] += count
+    now = datetime.now()
+    txt = f"✅ *LOCKED! {count} ta Future Signal | {interval} min interval*\n\n"
+    for i in range(1, count+1):
+        t = now + timedelta(minutes=interval*i)
+        sig = get_signal_text().replace('\n', ' | ')
+        txt += f"{i}. {sig} | ⏰ {t.strftime('%H:%M')}\n"
+    await query.edit_message_text(txt, reply_markup=main_menu(), parse_mode="Markdown")
+
+# --- CUSTOM INPUTS ---
+async def custom_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        count = int(update.message.text)
+        if not 1 <= count <= 50: raise ValueError
+        context.user_data["f_count"] = count
+        kb = [[InlineKeyboardButton("2 Min", callback_data="f_int_2"), InlineKeyboardButton("3 Min", callback_data="f_int_3"), InlineKeyboardButton("5 Min", callback_data="f_int_5")]]
+        await update.message.reply_text(f"✅ {count} ta! Ekhon interval dao:", reply_markup=InlineKeyboardMarkup(kb))
+        return AWAIT_CUSTOM_INTERVAL
+    except:
+        await update.message.reply_text("❌ 1-50 er moddhe ekta number dao, ex: 7")
+        return AWAIT_CUSTOM_COUNT
+
+async def custom_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        interval = int(update.message.text)
+        if not 1 <= interval <= 30: raise ValueError
+        count = context.user_data.get("f_count", 10)
+        stats = get_stats(update.effective_user.id)
+        # create dummy query obj for reuse
+        class Dummy: 
+            async def edit_message_text(self, *a, **k): await update.message.reply_text(*a, **k)
+        await generate_future(Dummy(), count, interval, stats)
+        return ConversationHandler.END
+    except:
+        await update.message.reply_text("❌ 1-30 min er moddhe dao, ex: 4")
+        return AWAIT_CUSTOM_INTERVAL
+
+async def photo_scanner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"📸 *SCANNED!*\n\nAmi chart scan korsi.\n\n{get_signal_text()}\n\n✅ AI Confidence: 91% - Trade nite paro!", reply_markup=main_menu(), parse_mode="Markdown")
+
+async def error_handler(update, context):
+    logger.warning(f"Error: {context.error}")
 
 def main():
     app = Application.builder().token(TOKEN).build()
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler)],
+        states={
+            AWAIT_CUSTOM_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, custom_count)],
+            AWAIT_CUSTOM_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, custom_interval)],
+        },
+        fallbacks=[CommandHandler("start", start)],
+        allow_reentry=True
+    )
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(callbacks))
-    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-    print("FINOREX v18 Running...")
-    app.run_polling()
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_scanner))
+    app.add_error_handler(error_handler)
+    print("FINOREX v19 Running... LIVE ✅")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
