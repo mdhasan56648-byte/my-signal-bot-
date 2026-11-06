@@ -2,15 +2,15 @@ import logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
+
 import os
 import random
-import logging
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters, ConversationHandler
 
 # --- SECURE SETUP ---
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
@@ -116,10 +116,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "tracker":
         await query.edit_message_text(f"📊 *TODAY TRACKER*\n\nToday Trades: {stats['today']}\nWin: {stats['wins']}\nLoss: {stats['loss']}\nProfit: +{stats['today']*2.3}%\n\nReset: 12 AM Daily", reply_markup=main_menu(), parse_mode="Markdown")
-    
+
     elif data == "howto":
         await query.edit_message_text("📚 *HOW TO TRADE*\n\n1. GET SIGNAL e click koro\n2. 87%+ confidence dekhle trade nao\n3. Money Management follow koro\n4. Scanner e chart dile aro accurate signal paba", reply_markup=main_menu(), parse_mode="Markdown")
-    
+
     elif data == "back":
         await query.edit_message_text(f"🤖 *FINOREX v19*\nSelect koro 👇", reply_markup=main_menu(), parse_mode="Markdown")
 
@@ -154,7 +154,6 @@ async def custom_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not 1 <= interval <= 30: raise ValueError
         count = context.user_data.get("f_count", 10)
         stats = get_stats(update.effective_user.id)
-        # create dummy query obj for reuse
         class Dummy: 
             async def edit_message_text(self, *a, **k): await update.message.reply_text(*a, **k)
         await generate_future(Dummy(), count, interval, stats)
