@@ -1,191 +1,135 @@
-import logging
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-
-import os
-import random
-from datetime import datetime, timedelta
+import os, csv, io, sqlite3, logging, threading
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from flask import Flask, jsonify
+from werkzeug.serving import make_server
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters, ConversationHandler
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-# --- SECURE SETUP ---
-logging.basicConfig(level=logging.WARNING)
-logger = logging.getLogger(__name__)
-TOKEN = os.getenv("TOKEN")
-if not TOKEN:
-    raise ValueError("TOKEN not found! Add TOKEN in Render Environment")
+NAME = 'FINOREX PREMIUM BOT'
+TZ = ZoneInfo('Asia/Dhaka')
+TOKEN = os.getenv('BOT_TOKEN', '')
+DB_PATH = os.getenv('DB_PATH', 'finorex.db')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger(NAME)
+web = Flask(__name__)
 
-# --- STATES FOR CUSTOM INPUT ---
-AWAIT_CUSTOM_COUNT, AWAIT_CUSTOM_INTERVAL = range(2)
+@web.get('/')
+def home(): return jsonify(name=NAME, status='running')
 
-# --- DATA ---
-PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "BTC/USD", "ETH/USD", "AUD/USD", "EUR/JPY"]
-user_data = {} # {user_id: {wins:0, loss:0, future_count:0, interval:0}}
+@web.get('/health')
+def health(): return jsonify(status='ok'), 200
 
-def get_stats(uid):
-    if uid not in user_data:
-        user_data[uid] = {"wins":0, "loss":0, "today":0}
-    return user_data[uid]
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.execute('''CREATE TABLE IF NOT EXISTS signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, pair TEXT,
+        direction TEXT, score INTEGER, payout INTEGER, created_at TEXT)''')
+    return con
 
-def get_signal_text():
-    pair = random.choice(PAIRS)
-    action = random.choice(["📈 UP", "📉 DOWN"])
-    time = random.choice(["1 MIN", "2 MIN", "3 MIN"])
-    confidence = random.randint(84, 96)
-    return f"🎯 *{pair}* | {action}\n⏱️ Exp: {time} | 🧠 Confidence: {confidence}%\n📅 {datetime.now().strftime('%H:%M:%S')}"
-
-# --- MAIN MENU ---
 def main_menu():
-    keyboard = [
-        [InlineKeyboardButton("🎯 GET SIGNAL", callback_data="get_signal"),
-         InlineKeyboardButton("🔮 FUTURE SIGNAL", callback_data="future_signal")],
-        [InlineKeyboardButton("🧠 AI ANALYZER", callback_data="ai_analyze"),
-         InlineKeyboardButton("📸 SCANNER", callback_data="scanner")],
-        [InlineKeyboardButton("💰 MONEY MANAGEMENT", callback_data="money")],
-        [InlineKeyboardButton("⚙️ SETTINGS", callback_data="settings"),
-         InlineKeyboardButton("🆘 HELP", callback_data="help")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('🎯 GET AI SIGNAL', callback_data='signal')],
+        [InlineKeyboardButton('🔮 FUTURE AI SIGNAL', callback_data='future')],
+        [InlineKeyboardButton('📸 LIVE CHART SCANNER', callback_data='scanner')],
+        [InlineKeyboardButton('⚙️ SETTINGS', callback_data='settings')],
+        [InlineKeyboardButton('🆘 HELP', callback_data='help')]])
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stats = get_stats(update.effective_user.id)
-    text = (
-        "🤖 *FINOREX v19 AI BRAIN*\n"
-        "🔒 SECURE | ⚡ NO BUG | 24/7 LIVE\n\n"
-        f"📊 TODAY: {stats['today']} Trades | ✅ Win: {stats['wins']}\n\n"
-        "Nicher theke select koro 👇"
-    )
-    await update.message.reply_text(text, reply_markup=main_menu(), parse_mode="Markdown")
+def settings_menu():
+    return InlineKeyboardMarkup([[InlineKeyboardButton('📚 Signal History', callback_data='history')],
+                                 [InlineKeyboardButton('⬅️ Main Menu', callback_data='home')]])
 
-# --- BUTTON HANDLER ---
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    uid = query.from_user.id
-    stats = get_stats(uid)
-    data = query.data
+def read_csv(data):
+    reader = csv.DictReader(io.StringIO(data.decode('utf-8-sig')))
+    if not reader.fieldnames: raise ValueError('CSV header missing.')
+    if not {'open','high','low','close'}.issubset({x.strip().lower() for x in reader.fieldnames}):
+        raise ValueError('CSV columns must be: open,high,low,close')
+    candles=[]
+    for row in reader:
+        r={k.strip().lower():v for k,v in row.items() if k}
+        c={k:float(r[k]) for k in ('open','high','low','close')}
+        if c['low'] > min(c['open'],c['close']) or c['high'] < max(c['open'],c['close']) or c['low']>c['high']:
+            raise ValueError('Invalid OHLC candle values.')
+        candles.append(c)
+    if len(candles)<30: raise ValueError('At least 30 candles are required.')
+    return candles
 
-    if data == "get_signal":
-        stats["today"] += 1
-        await query.edit_message_text(f"⚡ *INSTANT SIGNAL*\n\n{get_signal_text()}\n\n", reply_markup=main_menu(), parse_mode="Markdown")
+def ema(values, period):
+    a=2/(period+1); value=sum(values[:period])/period
+    for x in values[period:]: value=a*x+(1-a)*value
+    return value
 
-    elif data == "future_signal":
-        kb = [
-            [InlineKeyboardButton("5️⃣", callback_data="f_count_5"), InlineKeyboardButton("🔟", callback_data="f_count_10"),
-             InlineKeyboardButton("1️⃣5️⃣", callback_data="f_count_15"), InlineKeyboardButton("2️⃣0️⃣", callback_data="f_count_20")],
-            [InlineKeyboardButton("✏️ Custom [6/7/8...]", callback_data="f_count_custom")]
-        ]
-        await query.edit_message_text("🔮 *Koyta Signal Chai?*\nSelect koro:", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+def analyze(candles,payout):
+    if not 80<=payout<=100: return None,'Payout below 80% or invalid.'
+    close=[c['close'] for c in candles]; high=[c['high'] for c in candles]; low=[c['low'] for c in candles]
+    if any(x<=0 for x in close): return None,'Invalid price data.'
+    e9,e21=ema(close,9),ema(close,21)
+    changes=[close[i]-close[i-1] for i in range(1,len(close))][-14:]
+    gain=sum(max(x,0) for x in changes)/14; loss=sum(max(-x,0) for x in changes)/14
+    rsi=100.0 if loss==0 and gain>0 else (50.0 if loss==0 else 100-(100/(1+gain/loss)))
+    ranges=[h-l for h,l in zip(high,low)]; baseline=sum(ranges[-20:])/20
+    if baseline<=0: return None,'Insufficient candle movement.'
+    if ranges[-1]>baseline*2.5: return None,'High volatility. WAIT / NO-TRADE.'
+    up=(e9>e21 and close[-1]>e9 and 50<rsi<68)
+    down=(e9<e21 and close[-1]<e9 and 32<rsi<50)
+    if up: direction='UP'
+    elif down: direction='DOWN'
+    else: return None,'No aligned setup. WAIT / NO-TRADE.'
+    return {'direction':direction,'score':3,'rsi':round(rsi,1),'ema9':round(e9,6),'ema21':round(e21,6)},None
 
-    elif data.startswith("f_count_"):
-        if "custom" in data:
-            await query.edit_message_text("✏️ Koyta signal lagbe? 6-50 er moddhe ekta number likho (ex: 7)")
-            return AWAIT_CUSTOM_COUNT
-        count = int(data.split("_")[-1])
-        context.user_data["f_count"] = count
-        kb = [
-            [InlineKeyboardButton("2 Min", callback_data="f_int_2"), InlineKeyboardButton("3 Min", callback_data="f_int_3"), InlineKeyboardButton("5 Min", callback_data="f_int_5")],
-            [InlineKeyboardButton("✏️ Custom Min", callback_data="f_int_custom")]
-        ]
-        await query.edit_message_text(f"✅ {count} ta selected!\n\n⏰ *Koto Minute Por Por Chai?*", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+def save(user,pair,result,payout):
+    with db() as con:
+        cur=con.execute('INSERT INTO signals(user_id,pair,direction,score,payout,created_at) VALUES(?,?,?,?,?,?)',
+          (user,pair,result['direction'],result['score'],payout,datetime.now(TZ).isoformat()))
+        return cur.lastrowid
 
-    elif data.startswith("f_int_"):
-        if "custom" in data:
-            await query.edit_message_text("⏰ Koto minute por por? Number likho (ex: 4)")
-            return AWAIT_CUSTOM_INTERVAL
-        interval = int(data.split("_")[-1])
-        count = context.user_data.get("f_count", 10)
-        await generate_future(query, count, interval, stats)
+async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f'🤖 {NAME}\nQuotex OTC analysis assistant.\nUpload an OHLC CSV to check a setup.\nTimezone: Bangladesh (BST)',reply_markup=main_menu())
 
-    elif data == "ai_analyze":
-        await query.edit_message_text(f"🧠 *AI ANALYZER*\n\nMarket: {random.choice(PAIRS)}\nTrend: {random.choice(['BULLISH 📈','BEARISH 📉','SIDEWAYS ➡️'])}\nVolatility: HIGH\nSuggestion: WAIT FOR {get_signal_text()}", reply_markup=main_menu(), parse_mode="Markdown")
+async def buttons(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer(); d=q.data
+    if d=='home': await q.message.reply_text(NAME,reply_markup=main_menu())
+    elif d=='signal': await q.message.reply_text('Send CSV with open,high,low,close columns (30+ candles). Filename example: EURUSD_OTC_85.csv. 85 must be the actual payout shown by Quotex.')
+    elif d=='future': await q.message.reply_text('Future market prices cannot be known in advance. I will not invent future UP/DOWN signals. Upload current candles for a current setup check.')
+    elif d=='scanner': await q.message.reply_text('Send a chart screenshot here. This starter receives the image but does not yet extract verified OHLC from pixels. Send the matching CSV for analysis.')
+    elif d=='settings': await q.message.reply_text('⚙️ SETTINGS\nMarket: Quotex OTC only\nMinimum payout: 80%\nTimezone: Asia/Dhaka\nFilters: EMA 9/21 + RSI + candle-range volatility\nNo-trade filter: ON',reply_markup=settings_menu())
+    elif d=='history':
+        with db() as con: rows=con.execute('SELECT pair,direction,payout,created_at FROM signals WHERE user_id=? ORDER BY id DESC LIMIT 10',(q.from_user.id,)).fetchall()
+        msg='📚 RECENT ANALYSES\n'+'\n'.join(f'{p} | {di} | {po}% | {datetime.fromisoformat(t).strftime("%d-%b %I:%M %p")} BST' for p,di,po,t in rows) if rows else '📚 No saved analyses yet.'
+        await q.message.reply_text(msg,reply_markup=settings_menu())
+    elif d=='help': await q.message.reply_text('1) Export candle data as CSV.\n2) Columns: open,high,low,close.\n3) Minimum 30 rows.\n4) Filename: EURUSD_OTC_85.csv.\n5) Upload it.\nThis version does not connect to Quotex or fetch live prices automatically.')
 
-    elif data == "scanner":
-        await query.edit_message_text("📸 *SCANNER READY*\n\nTumi jekono chart er screenshot dao (Quotex/Binomo/Pocket Option). Ami AI diye scan kore instant signal diye dibo!", reply_markup=main_menu(), parse_mode="Markdown")
+async def photo(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('📸 Screenshot received. Automatic image-to-candle extraction is not enabled yet; exact candle prices/payout must not be guessed. Please send matching OHLC CSV data.')
 
-    elif data == "money":
-        await query.edit_message_text("💰 *MONEY MANAGEMENT*\n\nCapital: $100 dhore:\nLevel 1: $1\nLevel 2: $2 (Loss hole)\nLevel 3: $4\nLevel 4: $8\n\nMartingale 2-step use koro, 3 er beshi na. 95% safe!", reply_markup=main_menu(), parse_mode="Markdown")
-
-    elif data == "settings":
-        await query.edit_message_text("⚙️ *SETTINGS*\n\nBot Version: v19 Bug-Free\nStatus: 24/7 LIVE ✅\nSecurity: SECURED 🔒\n\nKono setting change lagbe na, sob auto!", reply_markup=main_menu(), parse_mode="Markdown")
-
-    elif data == "help":
-        kb = [[InlineKeyboardButton("📊 TODAY TRACKER", callback_data="tracker"), InlineKeyboardButton("📚 HOW TO TRADE", callback_data="howto")], [InlineKeyboardButton("🔙 BACK", callback_data="back")]]
-        await query.edit_message_text("🆘 *HELP CENTER*", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-
-    elif data == "tracker":
-        await query.edit_message_text(f"📊 *TODAY TRACKER*\n\nToday Trades: {stats['today']}\nWin: {stats['wins']}\nLoss: {stats['loss']}\nProfit: +{stats['today']*2.3}%\n\nReset: 12 AM Daily", reply_markup=main_menu(), parse_mode="Markdown")
-
-    elif data == "howto":
-        await query.edit_message_text("📚 *HOW TO TRADE*\n\n1. GET SIGNAL e click koro\n2. 87%+ confidence dekhle trade nao\n3. Money Management follow koro\n4. Scanner e chart dile aro accurate signal paba", reply_markup=main_menu(), parse_mode="Markdown")
-
-    elif data == "back":
-        await query.edit_message_text(f"🤖 *FINOREX v19*\nSelect koro 👇", reply_markup=main_menu(), parse_mode="Markdown")
-
-    return ConversationHandler.END
-
-async def generate_future(query, count, interval, stats):
-    stats["today"] += count
-    now = datetime.now()
-    txt = f"✅ *LOCKED! {count} ta Future Signal | {interval} min interval*\n\n"
-    for i in range(1, count+1):
-        t = now + timedelta(minutes=interval*i)
-        sig = get_signal_text().replace('\n', ' | ')
-        txt += f"{i}. {sig} | ⏰ {t.strftime('%H:%M')}\n"
-    await query.edit_message_text(txt, reply_markup=main_menu(), parse_mode="Markdown")
-
-# --- CUSTOM INPUTS ---
-async def custom_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def document(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    doc=update.message.document
+    if not doc.file_name.lower().endswith('.csv'):
+        await update.message.reply_text('Please upload a .csv file.'); return
     try:
-        count = int(update.message.text)
-        if not 1 <= count <= 50: raise ValueError
-        context.user_data["f_count"] = count
-        kb = [[InlineKeyboardButton("2 Min", callback_data="f_int_2"), InlineKeyboardButton("3 Min", callback_data="f_int_3"), InlineKeyboardButton("5 Min", callback_data="f_int_5")]]
-        await update.message.reply_text(f"✅ {count} ta! Ekhon interval dao:", reply_markup=InlineKeyboardMarkup(kb))
-        return AWAIT_CUSTOM_INTERVAL
-    except:
-        await update.message.reply_text("❌ 1-50 er moddhe ekta number dao, ex: 7")
-        return AWAIT_CUSTOM_COUNT
+        parts=doc.file_name.rsplit('.',1)[0].split('_')
+        if len(parts)<3 or parts[-2].upper()!='OTC': raise ValueError('Filename format: EURUSD_OTC_85.csv')
+        pair='_'.join(parts[:-2]).upper()+'_OTC'; payout=int(parts[-1].replace('%',''))
+        f=await doc.get_file(); data=bytes(await f.download_as_bytearray())
+        candles=read_csv(data); result,reason=analyze(candles,payout)
+        if reason:
+            await update.message.reply_text(f'🛡️ RISK FILTER: REJECTED\n{pair}\n{reason}'); return
+        sid=save(update.effective_user.id,pair,result,payout); now=datetime.now(TZ).strftime('%d-%b-%Y %I:%M:%S %p')
+        arrow='🟢 UP' if result['direction']=='UP' else '🔴 DOWN'
+        await update.message.reply_text(f'🤖 {NAME}\n\nPair: {pair}\nDirection: {arrow}\nAnalysis Score: {result["score"]}/3\nRSI: {result["rsi"]}\nEMA 9: {result["ema9"]}\nEMA 21: {result["ema21"]}\nPayout: {payout}%\nAnalysis time: {now} BST\nRisk checks: PASSED (basic only)\nSignal ID: FX-{sid:06d}\n\nONE STEP MTG: optional single recovery step only; no guaranteed recovery or profit. Demo-test first.')
+    except Exception as e:
+        log.exception('CSV analysis failed'); await update.message.reply_text(f'Could not analyze file: {e}')
 
-async def custom_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        interval = int(update.message.text)
-        if not 1 <= interval <= 30: raise ValueError
-        count = context.user_data.get("f_count", 10)
-        stats = get_stats(update.effective_user.id)
-        class Dummy: 
-            async def edit_message_text(self, *a, **k): await update.message.reply_text(*a, **k)
-        await generate_future(Dummy(), count, interval, stats)
-        return ConversationHandler.END
-    except:
-        await update.message.reply_text("❌ 1-30 min er moddhe dao, ex: 4")
-        return AWAIT_CUSTOM_INTERVAL
+async def errors(update:object,context:ContextTypes.DEFAULT_TYPE): log.error('Telegram error',exc_info=context.error)
 
-async def photo_scanner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"📸 *SCANNED!*\n\nAmi chart scan korsi.\n\n{get_signal_text()}\n\n✅ AI Confidence: 91% - Trade nite paro!", reply_markup=main_menu(), parse_mode="Markdown")
+def run():
+    if not TOKEN: raise RuntimeError('BOT_TOKEN missing. Set it in Render Environment Variables.')
+    port=int(os.getenv('PORT','10000')); server=make_server('0.0.0.0',port,web)
+    threading.Thread(target=server.serve_forever,daemon=True).start()
+    bot=Application.builder().token(TOKEN).build()
+    bot.add_handler(CommandHandler('start',start)); bot.add_handler(CallbackQueryHandler(buttons))
+    bot.add_handler(MessageHandler(filters.PHOTO,photo)); bot.add_handler(MessageHandler(filters.Document.ALL,document))
+    bot.add_error_handler(errors)
+    log.info('%s starting on port %s',NAME,port); bot.run_polling(drop_pending_updates=True)
 
-async def error_handler(update, context):
-    logger.warning(f"Error: {context.error}")
-
-def main():
-    app = Application.builder().token(TOKEN).build()
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler)],
-        states={
-            AWAIT_CUSTOM_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, custom_count)],
-            AWAIT_CUSTOM_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, custom_interval)],
-        },
-        fallbacks=[CommandHandler("start", start)],
-        allow_reentry=True
-    )
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.PHOTO, photo_scanner))
-    app.add_error_handler(error_handler)
-    print("FINOREX v19 Running... LIVE ✅")
-    app.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    main()
+if __name__=='__main__': run()
